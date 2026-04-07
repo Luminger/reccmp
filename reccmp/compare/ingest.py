@@ -501,3 +501,11 @@ def match_watcom_symbols(db: EntityDb) -> None:
         ):
             if symbol in recomp_by_symbol:
                 batch.match(orig_addr, recomp_by_symbol.pop(symbol))
+            else:
+                # Second pass: Watcom __watcall convention appends '_' to C names.
+                # Entities from load_markers use bare C names (e.g. "foo"),
+                # while those from load_watcom_debug / load_watcom_map use the
+                # mangled form (e.g. "foo_").  Try adding a trailing underscore.
+                mangled = symbol + "_"
+                if mangled in recomp_by_symbol:
+                    batch.match(orig_addr, recomp_by_symbol.pop(mangled))

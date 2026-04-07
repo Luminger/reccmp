@@ -63,6 +63,7 @@ from .ingest import (
     load_watcom_debug,
     load_watcom_lines,
     match_watcom_symbols,
+    load_watcom_map,
 )
 from .mutate import (
     match_array_elements,
@@ -83,6 +84,7 @@ class Compare:
     _lines_db: LinesDb
     _watcom_orig: WatcomDebugInfo | None
     _watcom_recomp: WatcomDebugInfo | None
+    _watcom_recomp_map: str | None
     code_files: list[TextFile]
     cvdump_analysis: CvdumpAnalysis | None
     orig_bin: Image
@@ -126,6 +128,7 @@ class Compare:
         self._db = EntityDb()
         self._watcom_orig = None
         self._watcom_recomp = None
+        self._watcom_recomp_map = None
 
         # For now, just redirect match alerts to the logger.
         self.report = create_logging_wrapper(logger)
@@ -232,7 +235,14 @@ class Compare:
             )
             load_watcom_lines(self._watcom_recomp, self._lines_db, self.recomp_bin)
 
-        match_watcom_symbols(self._db)
+        if self._watcom_recomp_map is not None:
+            section_bases = {
+                i + 1: sec.virtual_address
+                for i, sec in enumerate(self.recomp_bin.sections)
+            }
+            load_watcom_map(
+                self._watcom_recomp_map, self._db, section_bases, ImageId.RECOMP
+            )
 
         load_markers(
             self.code_files,
@@ -244,6 +254,13 @@ class Compare:
         )
 
         load_data_sources(self._db, self.data_sources)
+
+        # Run symbol matching AFTER all sources are loaded so that:
+        # - debug-info symbols on both sides are matched
+        # - annotation-based orig entities (from load_markers) are matched
+        #   against map/debug-info recomp entities by name, including the
+        #   Watcom __watcall trailing-underscore convention.
+        match_watcom_symbols(self._db)
 
         for img_id, binfile in (
             (ImageId.ORIG, self.orig_bin),
@@ -262,6 +279,7 @@ class Compare:
         source_paths: Iterable[Path] = (),
         target_id: str = "",
         original_mz_offset: int = 0,
+        recomp_map_path: Path | None = None,
     ) -> Self:
         """Construct and run a Compare for Open Watcom / DOS4GW LE binaries.
 
@@ -283,6 +301,11 @@ class Compare:
         original_mz_offset:
             File offset of the inner MZ stub in a DOS/4GW Pro executable.
             Pass 0 (default) for plain DOS/4GW.
+        recomp_map_path:
+            Path to the wlink-generated ``.map`` file for the recompiled binary.
+            Provides symbol names and addresses for all objects (C and ASM).
+            Use this when the recompiled binary lacks full Watcom debug info
+            (e.g. assembly-only objects or builds without ``-d1 -hw``).
         """
         # Load original binary
         orig_data = original_path.read_bytes()
@@ -319,8 +342,11 @@ class Compare:
             target_id=target_id,
             code_files=code_files,
         )
-        compare._watcom_orig   = watcom_orig
-        compare._watcom_recomp = watcom_recomp
+        compare._watcom_orig        = watcom_orig
+        compare._watcom_recomp       = watcom_recomp
+        compare._watcom_recomp_map   = (
+            recomp_map_path.read_text() if recomp_map_path is not None else None
+        )
         compare.run()
         return compare
 
