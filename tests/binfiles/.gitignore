@@ -1,2 +1,10 @@
 *
 !.gitignore
+
+# LE format test fixtures (open-source, compiled from le_src/hello.c)
+!hello_plain.exe
+!hello_pro.exe
+!le_src/
+!le_src/*
+!le_stubs/
+!le_stubs/*
