@@ -37,3 +37,18 @@ BINFILE_LE_PRO = TestBinfile(
 Compiled from tests/binfiles/le_src/hello.c with Open Watcom v2,
 using the DOS/4GW Pro stub extracted from a DOS/4GW Pro binary.
 See docs/le-format-support.md for the exact build recipe."""
+
+BINFILE_LE_WATDBG = TestBinfile(
+    "hello_watdbg.exe",
+    "c2e624c0fcbc6b7f81f7a88a8616cab8f13179305f7faeb2e904ef0598390059",
+)
+"""Plain DOS/4GW LE binary with Watcom Debug Info 3.0 appended.
+Compiled from tests/binfiles/le_src/hello.c with Open Watcom v2
+using -hw (Watcom debug format) and linked with DEBUG WATCOM ALL.
+Provides known ground-truth values for the Watcom debug parser tests.
+Build recipe:
+    wcc386 -bt=dos4g -mf -3r -fpi87 -d1 -hw -fo=hello_dbg.obj hello.c
+    wlink FORMAT os2 le DEBUG WATCOM ALL OPTION NODEFAULTLIBS \\
+          OPTION START=_cstart_ OPTION QUIET \\
+          LIBPATH $WATCOM/lib386 LIBPATH $WATCOM/lib386/dos \\
+          LIB clib3r LIB math387r FILE hello_dbg.obj NAME hello_watdbg.exe"""

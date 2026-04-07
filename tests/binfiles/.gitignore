@@ -4,6 +4,7 @@
 # LE format test fixtures (open-source, compiled from le_src/hello.c)
 !hello_plain.exe
 !hello_pro.exe
+!hello_watdbg.exe
 !le_src/
 !le_src/*
 !le_stubs/
