@@ -105,6 +105,12 @@ class Image:
     def imagebase(self) -> int:
         raise NotImplementedError
 
+    @property
+    def entry(self) -> int:
+        """Absolute virtual address of the module entry point.
+        Subclasses that have an entry point must override this."""
+        raise NotImplementedError
+
     def is_valid_vaddr(self, vaddr: int) -> bool:
         try:
             self.seek(vaddr)
@@ -114,6 +120,16 @@ class Image:
 
     def get_relative_addr(self, addr: int) -> tuple[int, int]:
         raise NotImplementedError
+
+    @property
+    def relocations(self) -> frozenset[int]:
+        """Set of virtual addresses where internal pointer fixups are applied.
+
+        Used by analysis passes (e.g. find_float_consts) to distinguish code that
+        references an absolute address from code that merely contains a large
+        immediate value.  Subclasses that carry relocation information should
+        override this; the default empty set is correct for formats without one."""
+        return frozenset()
 
     def is_relocated_addr(self, addr: int) -> bool:
         raise NotImplementedError

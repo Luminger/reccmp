@@ -205,3 +205,20 @@ def test_string_reads(memory: bytes, expected_string: bytes, expected_widechar: 
     img = RawImage.from_memory(memory)
     assert img.read_string(0) == expected_string
     assert img.read_widechar(0) == expected_widechar
+
+
+# ── Image base class interface ─────────────────────────────────────────────────
+
+
+def test_image_base_relocations_default():
+    """Image subclasses that don't override relocations get frozenset() for free.
+    This is the correct behaviour for formats without a relocation table."""
+    img = RawImage.from_memory(b"\x00" * 16)
+    assert img.relocations == frozenset()
+
+
+def test_image_base_entry_not_implemented():
+    """entry raises NotImplementedError for subclasses that don't implement it."""
+    img = RawImage.from_memory(b"\x00" * 16)
+    with pytest.raises(NotImplementedError):
+        _ = img.entry
