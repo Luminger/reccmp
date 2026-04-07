@@ -3,12 +3,16 @@ These functions load the entity and type databases with information from code an
 """
 
 import logging
+import re
+from pathlib import PureWindowsPath
 from typing import Iterable
 from collections.abc import Sequence
 from reccmp.formats.exceptions import (
     InvalidStringError,
 )
-from reccmp.formats import PEImage, TextFile
+from reccmp.formats import Image, PEImage, TextFile
+from reccmp.formats.lx import LXImage
+from reccmp.formats.watcom_debug import WatcomDebugInfo
 from reccmp.cvdump import CvdumpTypesParser, CvdumpAnalysis
 from reccmp.parser import DecompCodebase
 from reccmp.types import EntityType, ImageId
@@ -18,6 +22,8 @@ from reccmp.compare.event import (
     reccmp_report_nop,
 )
 from .csv import ReccmpCsvParserError, ReccmpCsvFatalParserError, csv_parse
+
+_MAP_SYMBOL_RE = re.compile(r"^([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8})[*+]?\s+(\S+)")
 from .db import EntityDb, entity_name_from_string
 from .lines import LinesDb
 
@@ -144,7 +150,7 @@ def load_cvdump_lines(
 def load_markers(
     code_files: Sequence[TextFile],
     lines_db: LinesDb,
-    orig_bin: PEImage,
+    orig_bin: Image,
     target_id: str,
     db: EntityDb,
     report: ReccmpReportProtocol = reccmp_report_nop,
@@ -326,3 +332,172 @@ def load_csv(db: EntityDb, csv_file: TextFile):
     with db.batch() as batch:
         for addr, values in rows:
             batch.set(ImageId.ORIG, addr, **values)
+
+
+# ── Watcom / LE ingestion ─────────────────────────────────────────────────────
+
+
+def load_watcom_debug(
+    debug_info: WatcomDebugInfo,
+    db: EntityDb,
+    bin: LXImage,
+    image_id: ImageId,
+) -> None:
+    """Populate EntityDb from Watcom Debug Info 3.0.
+
+    Computes symbol virtual addresses from the LE object table stored in
+    *bin*.  Function sizes are estimated from the gap to the next symbol
+    within the same segment; the final symbol in each segment gets the
+    remainder of that segment's virtual size.
+    """
+    if not debug_info.symbols:
+        return
+
+    # Group symbols by segment so we can compute sizes within each segment.
+    from collections import defaultdict
+    by_seg: dict[int, list] = defaultdict(list)
+    for sym in debug_info.symbols:
+        by_seg[sym.segment].append(sym)
+
+    for seg_syms in by_seg.values():
+        seg_syms.sort(key=lambda s: s.offset)
+
+    with db.batch() as batch:
+        for seg, seg_syms in by_seg.items():
+            idx = seg - 1
+            if idx < 0 or idx >= len(bin.sections):
+                continue
+            section = bin.sections[idx]
+            seg_vsize = section.virtual_size
+            seg_base = section.virtual_address
+
+            for i, sym in enumerate(seg_syms):
+                addr = seg_base + sym.offset
+
+                # Size: gap to next symbol in this segment, or remainder
+                if i + 1 < len(seg_syms):
+                    size = seg_syms[i + 1].offset - sym.offset
+                else:
+                    size = seg_vsize - sym.offset
+
+                entity_type = EntityType.FUNCTION if sym.is_code else EntityType.DATA
+
+                batch.set(
+                    image_id,
+                    addr,
+                    type=entity_type,
+                    name=sym.name,
+                    symbol=sym.raw_name,
+                    size=size,
+                )
+
+
+def load_watcom_lines(
+    debug_info: WatcomDebugInfo,
+    lines_db: LinesDb,
+    bin: LXImage,
+) -> None:
+    """Populate LinesDb from Watcom Debug Info 3.0 line number tables.
+
+    Line entries are grouped by source module and added to *lines_db* using
+    the module's recorded path as the foreign path key.  The code segment
+    base address from *bin* is used to convert flat code offsets to virtual
+    addresses.
+
+    Function starts are marked using the virtual addresses of all code symbols,
+    mirroring what :func:`load_cvdump_lines` does with PDB data.
+    """
+    if not bin.sections:
+        return
+
+    code_base = bin.sections[0].virtual_address  # segment 1 = index 0
+
+    # Group line entries by module index
+    from collections import defaultdict
+    by_module: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for entry in debug_info.line_numbers:
+        va = code_base + entry.code_offset
+        by_module[entry.module_index].append((entry.line, va))
+
+    for mod_idx, lines in by_module.items():
+        if mod_idx >= len(debug_info.modules):
+            continue
+        module = debug_info.modules[mod_idx]
+        # Wrap the recorded path as a PureWindowsPath — LinesDb matches by
+        # filename (.name) so the path style doesn't matter for the lookup.
+        foreign_path = PureWindowsPath(module.name)
+        lines_db.add_lines(foreign_path, lines)
+
+    # Mark function starts using code symbol addresses so that find_function()
+    # can identify the entry point of each annotated function.
+    code_sym_addrs = [
+        bin.sections[sym.segment - 1].virtual_address + sym.offset
+        for sym in debug_info.symbols
+        if sym.is_code and 0 < sym.segment <= len(bin.sections)
+    ]
+    lines_db.mark_function_starts(code_sym_addrs)
+
+
+def load_watcom_map(
+    map_content: str,
+    db: EntityDb,
+    section_bases: dict[int, int],
+    image_id: ImageId,
+) -> None:
+    """Populate EntityDb from a wlink-generated .map file.
+
+    *section_bases* maps 1-based LE segment numbers to their base virtual
+    addresses (e.g. ``{1: 0x10000, 2: 0x20000}``).  Only segments present
+    in this dict are loaded.
+
+    This is a lightweight alternative to :func:`load_watcom_debug` for
+    cases where a full debug build is not available.  It provides symbol
+    names and addresses but no sizes.
+
+    Map file symbol lines have the form::
+
+        SSSS:OOOOOOOO[*+]  symbol_name
+    """
+    with db.batch() as batch:
+        for line in map_content.splitlines():
+            m = _MAP_SYMBOL_RE.match(line)
+            if m is None:
+                continue
+            seg = int(m.group(1), 16)
+            offset = int(m.group(2), 16)
+            name = m.group(3)
+
+            if seg not in section_bases:
+                continue
+
+            addr = section_bases[seg] + offset
+            entity_type = EntityType.FUNCTION if seg == 1 else EntityType.DATA
+
+            batch.set(image_id, addr, type=entity_type, symbol=name)
+
+
+def match_watcom_symbols(db: EntityDb) -> None:
+    """Match ORIG and RECOMP entities by their raw Watcom mangled symbol name.
+
+    Watcom preserves mangled names identically in the debug info and the
+    linker map file, so a direct string equality match is sufficient.
+
+    This is the Watcom equivalent of :func:`reccmp.compare.match_msvc.match_symbols`
+    (without the 255-character MSVC truncation).
+    """
+    # Build a lookup from symbol name -> recomp_addr for unmatched recomp entities
+    recomp_by_symbol: dict[str, int] = {}
+    for recomp_addr, symbol in db.sql.execute(
+        """SELECT recomp_addr, json_extract(kvstore, '$.symbol') as symbol
+           FROM recomp_unmatched WHERE symbol IS NOT NULL"""
+    ):
+        # Only take the first occurrence of each symbol (duplicates are skipped)
+        recomp_by_symbol.setdefault(symbol, recomp_addr)
+
+    with db.batch() as batch:
+        for orig_addr, symbol in db.sql.execute(
+            """SELECT orig_addr, json_extract(kvstore, '$.symbol') as symbol
+               FROM orig_unmatched WHERE symbol IS NOT NULL"""
+        ):
+            if symbol in recomp_by_symbol:
+                batch.match(orig_addr, recomp_by_symbol.pop(symbol))
