@@ -134,3 +134,50 @@ def test_project_source_root_missing_key():
 
     assert isinstance(p.targets["TEST"].source_root, tuple)
     assert p.targets["TEST"].source_root == ()
+
+
+# ── BuildFileTarget: pdb optional, map_file added ─────────────────────────────
+
+
+def test_build_target_with_pdb():
+    """Existing YAML with pdb: still loads correctly."""
+    from reccmp.project.config import BuildFile
+    content = """\
+project: /some/project
+targets:
+    TEST:
+        path: build/test.exe
+        pdb: build/test.pdb
+"""
+    b = BuildFile.from_str(content)
+    assert b.targets["TEST"].pdb == Path("build/test.pdb")
+    assert b.targets["TEST"].map_file is None
+
+
+def test_build_target_with_map_file():
+    """YAML with map_file: and no pdb: loads correctly."""
+    from reccmp.project.config import BuildFile
+    content = """\
+project: /some/project
+targets:
+    TEST:
+        path: build/test.exe
+        map_file: build/test.map
+"""
+    b = BuildFile.from_str(content)
+    assert b.targets["TEST"].map_file == Path("build/test.map")
+    assert b.targets["TEST"].pdb is None
+
+
+def test_build_target_neither_raises():
+    """YAML with neither pdb nor map_file raises a validation error."""
+    from reccmp.project.config import BuildFile
+    import pytest
+    content = """\
+project: /some/project
+targets:
+    TEST:
+        path: build/test.exe
+"""
+    with pytest.raises(Exception):
+        BuildFile.from_str(content)

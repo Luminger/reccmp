@@ -420,3 +420,109 @@ def test_materialize_project_target():
     del project.targets["TEST"].source_paths
     with pytest.raises(IncompleteReccmpTargetError):
         project.get("TEST")
+
+
+# ── RecCmpTarget: optional pdb / map_file ─────────────────────────────────────
+
+
+def test_reccmp_target_with_map_file():
+    """RecCmpTarget can be constructed with recompiled_map and no recompiled_pdb."""
+    from reccmp.project.detect import RecCmpTarget, GhidraConfig, ReportConfig
+    t = RecCmpTarget(
+        target_id="TEST",
+        filename="test.exe",
+        sha256="",
+        source_paths=(Path("src"),),
+        original_path=Path("test.exe"),
+        recompiled_path=Path("build/test.exe"),
+        recompiled_map=Path("build/test.map"),
+        ghidra_config=GhidraConfig(),
+        report_config=ReportConfig(),
+    )
+    assert t.recompiled_pdb is None
+    assert t.recompiled_map == Path("build/test.map")
+
+
+def test_project_get_fails_without_any_symbols():
+    """RecCmpProject.get() raises IncompleteReccmpTargetError when neither
+    recompiled_pdb nor recompiled_map is set."""
+    from reccmp.project.detect import (
+        RecCmpPartialTarget,
+        RecCmpProject,
+        IncompleteReccmpTargetError,
+    )
+    target = RecCmpPartialTarget(
+        target_id="TEST",
+        filename="test.exe",
+        sha256="",
+        original_path=Path("test.exe"),
+        recompiled_path=Path("build/test.exe"),
+        source_paths=(Path("src"),),
+    )
+    project = RecCmpProject()
+    project.targets["TEST"] = target
+    with pytest.raises(IncompleteReccmpTargetError):
+        project.get("TEST")
+
+
+def test_project_get_succeeds_with_map_file(tmp_path_factory):
+    """RecCmpProject.get() succeeds when recompiled_map is set and recompiled_pdb is not."""
+    from reccmp.project.detect import (
+        RecCmpPartialTarget,
+        RecCmpProject,
+    )
+    target = RecCmpPartialTarget(
+        target_id="TEST",
+        filename="test.exe",
+        sha256="",
+        original_path=Path("test.exe"),
+        recompiled_path=Path("build/test.exe"),
+        recompiled_map=Path("build/test.map"),
+        source_paths=(Path("src"),),
+    )
+    project = RecCmpProject()
+    project.targets["TEST"] = target
+    result = project.get("TEST")
+    assert result.recompiled_pdb is None
+    assert result.recompiled_map == Path("build/test.map")
+
+
+def test_detect_recompiled_finds_map_file(tmp_path_factory):
+    """detect_project in RECOMPILED mode finds a .map file when no .pdb exists."""
+    from reccmp.project.detect import detect_project, DetectWhat
+    from reccmp.project.config import ProjectFile
+    from reccmp.project.common import RECCMP_PROJECT_CONFIG
+
+    proj_dir = tmp_path_factory.mktemp("proj")
+    build_dir = tmp_path_factory.mktemp("build")
+
+    # Create a minimal reccmp-project.yml
+    project_yml = proj_dir / RECCMP_PROJECT_CONFIG
+    project_yml.write_text("""\
+targets:
+    TEST:
+        filename: test.exe
+        source-root: src
+        hash:
+            sha256: abc123
+""")
+
+    # Create binary + .map (no .pdb)
+    binary = build_dir / "test.exe"
+    binary.write_bytes(b"\x00")
+    map_file = build_dir / "test.map"
+    map_file.write_text("map content")
+
+    detect_project(
+        project_directory=proj_dir,
+        search_path=[build_dir],
+        detect_what=DetectWhat.RECOMPILED,
+        build_directory=build_dir,
+    )
+
+    from reccmp.project.config import BuildFile
+    from reccmp.project.common import RECCMP_BUILD_CONFIG
+    build_cfg = BuildFile.from_file(build_dir / RECCMP_BUILD_CONFIG)
+    assert "TEST" in build_cfg.targets
+    assert build_cfg.targets["TEST"].map_file == map_file
+    assert build_cfg.targets["TEST"].pdb is None

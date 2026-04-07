@@ -110,7 +110,14 @@ class BuildFileTarget:
     """Target schema for reccmp-build.yml"""
 
     path: Path
-    pdb: Path
+    pdb: Path | None = None
+    map_file: Path | None = None
+
+    def __post_init__(self):
+        if self.pdb is None and self.map_file is None:
+            raise ValueError(
+                "BuildFileTarget requires either 'pdb' or 'map_file' to be set"
+            )
 
 
 class BuildFile(YmlFileModel):

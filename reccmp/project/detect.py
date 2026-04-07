@@ -158,6 +158,7 @@ class RecCmpPartialTarget:
     original_path: Path | None = None
     recompiled_path: Path | None = None
     recompiled_pdb: Path | None = None
+    recompiled_map: Path | None = None
 
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] | None = None
@@ -193,7 +194,8 @@ class RecCmpTarget:
 
     original_path: Path
     recompiled_path: Path
-    recompiled_pdb: Path
+    recompiled_pdb: Path | None = None
+    recompiled_map: Path | None = None
 
     # Data to set directly in the database (addresses refer to orig binary)
     data_sources: list[Path] = field(default_factory=list)
@@ -233,10 +235,17 @@ class RecCmpProject:
             "source_paths",
             "original_path",
             "recompiled_path",
-            "recompiled_pdb",
         )
 
-        missing_attrs = [attr for attr in required_attrs if not getattr(target, attr)]
+        missing_attrs = [
+            attr for attr in required_attrs if not getattr(target, attr, None)
+        ]
+        # Need at least one symbols source: PDB (MSVC) or map file (Watcom/wlink)
+        if not getattr(target, "recompiled_pdb", None) and not getattr(
+            target, "recompiled_map", None
+        ):
+            missing_attrs.append("recompiled_pdb or recompiled_map")
+
         if missing_attrs:
             raise IncompleteReccmpTargetError(
                 f"Target {target_id} is missing data: {','.join(missing_attrs)}"
@@ -246,7 +255,6 @@ class RecCmpProject:
         assert target.source_paths  # Must have at least one
         assert target.original_path is not None
         assert target.recompiled_path is not None
-        assert target.recompiled_pdb is not None
 
         if target.ghidra_config is not None:
             ghidra = target.ghidra_config
@@ -266,7 +274,8 @@ class RecCmpProject:
             sha256=target.sha256,
             original_path=target.original_path,
             recompiled_path=target.recompiled_path,
-            recompiled_pdb=target.recompiled_pdb,
+            recompiled_pdb=getattr(target, "recompiled_pdb", None),
+            recompiled_map=getattr(target, "recompiled_map", None),
             source_paths=target.source_paths,
             ghidra_config=ghidra,
             data_sources=data_sources,
@@ -405,9 +414,14 @@ class RecCmpProject:
                 project.targets[target_id].recompiled_path = (
                     build_directory / build_target.path
                 )
-                project.targets[target_id].recompiled_pdb = (
-                    build_directory / build_target.pdb
-                )
+                if build_target.pdb is not None:
+                    project.targets[target_id].recompiled_pdb = (
+                        build_directory / build_target.pdb
+                    )
+                if build_target.map_file is not None:
+                    project.targets[target_id].recompiled_map = (
+                        build_directory / build_target.map_file
+                    )
 
         return project
 
@@ -417,7 +431,16 @@ class RecCmpPathsAction(argparse.Action):
         self, parser, namespace, values: Sequence[str] | None, option_string=None
     ):
         assert isinstance(values, Sequence)
-        original, recompiled, pdb, source_paths = list(Path(o) for o in values)
+        original, recompiled, symbols, source_paths = list(Path(o) for o in values)
+
+        # Detect whether the third argument is a PDB or a map file by extension.
+        pdb = symbols if symbols.suffix.lower() == ".pdb" else None
+        map_file = symbols if symbols.suffix.lower() == ".map" else None
+        if pdb is None and map_file is None:
+            logger.warning(
+                "'%s' is neither a .pdb nor a .map file; assuming PDB", symbols.name
+            )
+            pdb = symbols
 
         # Assumes base filename of the original binary is the module name.
         target_id = original.stem.upper()
@@ -431,6 +454,7 @@ class RecCmpPathsAction(argparse.Action):
             original_path=original,
             recompiled_path=recompiled,
             recompiled_pdb=pdb,
+            recompiled_map=map_file,
             source_paths=(source_paths,),
             ghidra_config=GhidraConfig(),
             report_config=ReportConfig(),
@@ -448,13 +472,13 @@ def argparse_add_project_target_args(parser: argparse.ArgumentParser):
         metavar=(
             "<original-binary>",
             "<recompiled-binary>",
-            "<recompiled-pdb>",
+            "<recompiled-pdb-or-map>",
             "<source-root>",
         ),
         nargs=4,
         action=RecCmpPathsAction,
         dest="paths_target",
-        help="The original binary, the recompiled binary, the PDB of the recompiled binary, and the source root",
+        help="The original binary, the recompiled binary, the PDB or map file of the recompiled binary, and the source root",
     )
 
 
@@ -482,9 +506,13 @@ def argparse_parse_project_target(
             f"Recompiled binary {target.recompiled_path} does not exist"
         )
 
-    if not target.recompiled_pdb.is_file():
+    if target.recompiled_pdb is not None and not target.recompiled_pdb.is_file():
         raise RecCmpProjectException(
             f"Symbols PDB {target.recompiled_pdb} does not exist"
+        )
+    if target.recompiled_map is not None and not target.recompiled_map.is_file():
+        raise RecCmpProjectException(
+            f"Symbols map file {target.recompiled_map} does not exist"
         )
 
     for source_path in target.source_paths:
@@ -559,21 +587,28 @@ def detect_project(
         def detect_recompiled(filename: str):
             for search_path_folder in search_path:
                 binary = search_path_folder / filename
+                if not binary.is_file():
+                    continue
                 pdb = binary.with_suffix(".pdb")
-                if binary.is_file():
-                    if pdb.is_file():
-                        build_data.targets.setdefault(
-                            target_id, BuildFileTarget(path=binary, pdb=pdb)
-                        )
-                        logger.info("Found %s -> %s", target_id, binary)
-                        logger.info("Found %s -> %s", target_id, pdb)
-                        return
-
-                    logger.warning(
-                        "Missing PDB file '%s' next to binary '%s'",
-                        pdb.name,
-                        str(binary),
+                map_file = binary.with_suffix(".map")
+                if pdb.is_file():
+                    build_data.targets.setdefault(
+                        target_id, BuildFileTarget(path=binary, pdb=pdb)
                     )
+                    logger.info("Found %s -> %s", target_id, binary)
+                    logger.info("Found %s -> %s", target_id, pdb)
+                    return
+                if map_file.is_file():
+                    build_data.targets.setdefault(
+                        target_id, BuildFileTarget(path=binary, map_file=map_file)
+                    )
+                    logger.info("Found %s -> %s", target_id, binary)
+                    logger.info("Found %s -> %s (map)", target_id, map_file)
+                    return
+                logger.warning(
+                    "Missing PDB or map file next to binary '%s'",
+                    str(binary),
+                )
 
             logger.warning("Failed to detect a recompile for '%s'", filename)
 
