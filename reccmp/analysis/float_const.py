@@ -13,7 +13,7 @@ Then filter on pointers into read-only sections.
 import re
 import struct
 from typing import Iterator, NamedTuple
-from reccmp.formats import PEImage
+from reccmp.formats import Image
 
 SINGLE_PRECISION_OPCODES = frozenset(
     [
@@ -84,7 +84,7 @@ class FloatConstant(NamedTuple):
     value: float
 
 
-def find_float_consts(image: PEImage) -> Iterator[FloatConstant]:
+def find_float_consts(image: Image) -> Iterator[FloatConstant]:
     """Floating point instructions that refer to a memory address can
     point to constant values. Search the code sections to find FP
     instructions and check whether the pointer address refers to

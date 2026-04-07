@@ -4,7 +4,7 @@ https://www.openrce.org/articles/full_view/21"""
 import re
 import struct
 from typing import Iterator, NamedTuple
-from reccmp.formats import PEImage
+from reccmp.formats import Image
 
 # Magic strings:
 # - 0x19930520: up to VC6
@@ -52,7 +52,7 @@ def find_funcinfo_in_buffer(buf: bytes, base_addr: int) -> Iterator[FuncInfo]:
         yield FuncInfo(addr=base_addr + ofs, unwinds=unwinds)
 
 
-def find_funcinfo(image: PEImage) -> Iterator[FuncInfo]:
+def find_funcinfo(image: Image) -> Iterator[FuncInfo]:
     """Find all FuncInfo structs in the image."""
     for region in image.get_const_regions():
         yield from find_funcinfo_in_buffer(region.data, region.addr)
@@ -66,7 +66,7 @@ def find_mov_eax_jmp_in_buffer(
         yield (base_addr + match.start(), match.group(1))
 
 
-def find_eh_handlers(image: PEImage) -> Iterator[tuple[int, FuncInfo]]:
+def find_eh_handlers(image: Image) -> Iterator[tuple[int, FuncInfo]]:
     """Find each SEH handler function and its associated FuncInfo struct."""
 
     # There can be multiple code and const data sections in a program.

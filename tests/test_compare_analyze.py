@@ -18,6 +18,7 @@ from reccmp.compare.analyze import (
     create_imports,
     create_import_thunks,
     create_seh_entities,
+    match_exports,
 )
 from reccmp.analysis.funcinfo import FuncInfo, UnwindMapEntry
 
@@ -53,7 +54,7 @@ def get_ref_displacement(
 
 def test_create_analysis_strings(db: EntityDb):
     """Should add this ordinary string to the database."""
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     binfile.iter_string = Mock(return_value=[(100, "Hello")])
     binfile.relocations = set()
 
@@ -70,7 +71,7 @@ def test_create_analysis_strings_do_not_replace(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FLOAT)
 
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     binfile.iter_string = Mock(return_value=[(100, "Hello")])
     binfile.relocations = set()
 
@@ -84,7 +85,7 @@ def test_create_analysis_strings_do_not_replace(db: EntityDb):
 def test_create_analysis_strings_not_relocated(db: EntityDb):
     """Should not add the string if its address is the site of a relocation.
     i.e. We know this is a pointer, despite how it appears."""
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     binfile.iter_string = Mock(return_value=[(100, "Hello")])
     binfile.relocations = {100}
 
@@ -95,7 +96,7 @@ def test_create_analysis_strings_not_relocated(db: EntityDb):
 
 def test_create_analysis_strings_not_latin1(db: EntityDb):
     """Should not add the string if our heuristic check for Latin1 (ANSI) fails."""
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     # Starts with BEL character to play the Windows chord sound
     binfile.iter_string = Mock(return_value=[(100, "\x07Alert!")])
     binfile.relocations = set()
@@ -107,7 +108,7 @@ def test_create_analysis_strings_not_latin1(db: EntityDb):
 
 def test_create_thunks(db: EntityDb):
     """Should create entities for each thunk in the PE image's list"""
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     binfile.thunks = [(100, 200)]
 
     create_thunks(db, ImageId.ORIG, binfile)
@@ -123,7 +124,7 @@ def test_create_thunks_do_not_replace(db: EntityDb):
     with db.batch() as batch:
         batch.set(ImageId.ORIG, 100, type=EntityType.FUNCTION, size=500)
 
-    binfile = Mock(spec=[])
+    binfile = Mock(spec=PEImage)
     binfile.thunks = [(100, 200)]
 
     create_thunks(db, ImageId.ORIG, binfile)
@@ -391,3 +392,66 @@ def test_create_seh_entities(db: EntityDb, image_id: ImageId):
     e = db.get(image_id, funcinfo_addr)
     assert e is not None
     assert e.get("type") == EntityType.DATA
+
+
+# ── Non-PE guard tests ────────────────────────────────────────────────────────
+# Each guarded function must be a no-op for any non-PEImage, leaving the
+# database empty.  We use Mock(spec=[]) because it is not a PEImage instance.
+
+
+def test_create_analysis_strings_non_pe(db: EntityDb):
+    """Guard fires for non-PE images — no strings added."""
+    binfile = Mock(spec=[])
+    create_analysis_strings(db, ImageId.ORIG, binfile)
+    assert list(db.get_all()) == []
+
+
+def test_create_thunks_non_pe(db: EntityDb):
+    """Guard fires for non-PE images — no thunk entities added."""
+    binfile = Mock(spec=[])
+    create_thunks(db, ImageId.ORIG, binfile)
+    assert list(db.get_all()) == []
+
+
+def test_match_exports_non_pe(db: EntityDb):
+    """Guard fires when either binary is not a PEImage — no matches added."""
+    binfile = Mock(spec=[])
+    match_exports(db, binfile, binfile)
+    assert list(db.get_all()) == []
+
+
+def test_create_seh_non_pe(db: EntityDb):
+    """Guard fires for non-PE images — no SEH entities added."""
+    binfile = Mock(spec=[])
+    create_seh_entities(db, ImageId.ORIG, binfile)
+    assert list(db.get_all()) == []
+
+
+def test_create_vtordisps_non_pe(db: EntityDb):
+    """Guard fires for non-PE images — no vtordisp entities added."""
+    binfile = Mock(spec=[])
+    create_analysis_vtordisps(db, ImageId.ORIG, binfile)
+    assert list(db.get_all()) == []
+
+
+def test_find_float_consts_non_pe():
+    """find_float_consts accepts any Image and returns empty when there are no
+    const regions (as is the case for DOS/4GW LE binaries)."""
+    from reccmp.analysis.float_const import find_float_consts
+
+    binfile = Mock(spec=[])
+    binfile.get_code_regions = Mock(return_value=iter([]))
+    binfile.get_const_regions = Mock(return_value=iter([]))
+    binfile.relocations = frozenset()
+    assert list(find_float_consts(binfile)) == []
+
+
+def test_find_eh_handlers_non_pe():
+    """find_eh_handlers accepts any Image and returns empty when there are no
+    MSVC SEH FuncInfo magic bytes in the const regions."""
+    from reccmp.analysis.funcinfo import find_eh_handlers
+
+    binfile = Mock(spec=[])
+    binfile.get_code_regions = Mock(return_value=iter([]))
+    binfile.get_const_regions = Mock(return_value=iter([]))
+    assert list(find_eh_handlers(binfile)) == []

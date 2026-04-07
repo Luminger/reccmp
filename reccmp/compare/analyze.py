@@ -24,18 +24,21 @@ from .queries import get_floats_without_data, get_strings_without_data
 logger = logging.getLogger(__name__)
 
 
-def match_entry(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
-    # The _entry symbol is referenced in the PE header so we get this match for free.
+def match_entry(db: EntityDb, orig_bin: Image, recomp_bin: Image):
+    # The _entry symbol is referenced in the executable header so we get this match for free.
     with db.batch() as batch:
         batch.set(ImageId.RECOMP, recomp_bin.entry, type=EntityType.FUNCTION)
         batch.match(orig_bin.entry, recomp_bin.entry)
 
 
-def create_analysis_strings(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_analysis_strings(db: EntityDb, img_id: ImageId, binfile: Image):
     """Search both binaries for Latin1 strings.
     We use the insert_() method so that thse strings will not overwrite
     an existing entity. It's possible that some variables or pointers
-    will be mistakenly identified as short strings."""
+    will be mistakenly identified as short strings.
+    Only PE images have iter_string(); other formats are skipped."""
+    if not isinstance(binfile, PEImage):
+        return
     with db.batch() as batch:
         for addr, string in binfile.iter_string("latin1"):
             # If the address is the site of a relocation, this is a pointer, not a string.
@@ -52,7 +55,7 @@ def create_analysis_strings(db: EntityDb, img_id: ImageId, binfile: PEImage):
                 )
 
 
-def create_analysis_floats(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_analysis_floats(db: EntityDb, img_id: ImageId, binfile: Image):
     """Add floating point constants in each binary to the database.
     We are not matching anything right now because these values are not
     deduped like strings."""
@@ -68,10 +71,13 @@ def create_analysis_floats(db: EntityDb, img_id: ImageId, binfile: PEImage):
                 )
 
 
-def create_seh_entities(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_seh_entities(db: EntityDb, img_id: ImageId, binfile: Image):
     """Create entities for the SEH (structured exception handling)
     handler and funcinfo struct. For images without a relocation table,
-    this will allow us to replace the addresses for both items."""
+    this will allow us to replace the addresses for both items.
+    Only MSVC PE binaries contain FuncInfo structures; other formats are skipped."""
+    if not isinstance(binfile, PEImage):
+        return
     with db.batch() as batch:
         for handler_addr, funcinfo in find_eh_handlers(binfile):
             # Using names derived from symbols in .cpp.s generated asm.
@@ -131,9 +137,12 @@ def create_import_thunks(db: EntityDb, image_id: ImageId, binfile: Image):
             batch.set_ref(image_id, thunk.addr, ref=thunk.import_addr)
 
 
-def create_thunks(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_thunks(db: EntityDb, img_id: ImageId, binfile: Image):
     """Create entities for any thunk functions in the image.
-    These are the result of an incremental build."""
+    These are the result of an incremental build.
+    Only PE images have compiler-generated thunks; other formats are skipped."""
+    if not isinstance(binfile, PEImage):
+        return
     with db.batch() as batch:
         for thunk_addr, func_addr in binfile.thunks:
             if not db.used(img_id, thunk_addr):
@@ -151,7 +160,9 @@ def create_thunks(db: EntityDb, img_id: ImageId, binfile: PEImage):
             # they will either be equal or left unmatched. Set skip=True.
 
 
-def match_exports(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
+def match_exports(db: EntityDb, orig_bin: Image, recomp_bin: Image):
+    if not isinstance(orig_bin, PEImage) or not isinstance(recomp_bin, PEImage):
+        return
     # invert for name lookup
     orig_exports = {y: x for (x, y) in orig_bin.exports}
 
@@ -178,10 +189,13 @@ def match_exports(db: EntityDb, orig_bin: PEImage, recomp_bin: PEImage):
             batch.match(orig_addr, recomp_addr)
 
 
-def create_analysis_vtordisps(db: EntityDb, img_id: ImageId, binfile: PEImage):
+def create_analysis_vtordisps(db: EntityDb, img_id: ImageId, binfile: Image):
     """Creates entities for each detected vtordisp function in the image.
     The critical step is to set the 'vtordisp' attribute to True, which distinguishes
-    these entities from others (i.e. thunks) that have the 'ref_' attribute set."""
+    these entities from others (i.e. thunks) that have the 'ref_' attribute set.
+    Only MSVC PE binaries generate vtordisp functions; other formats are skipped."""
+    if not isinstance(binfile, PEImage):
+        return
     with db.batch() as batch:
         for vtor in find_vtordisp(binfile):
             batch.set(
@@ -199,7 +213,7 @@ def create_analysis_vtordisps(db: EntityDb, img_id: ImageId, binfile: PEImage):
                 batch.set(img_id, vtor.func_addr, type=EntityType.FUNCTION)
 
 
-def complete_partial_floats(db: EntityDb, image_id: ImageId, binfile: PEImage):
+def complete_partial_floats(db: EntityDb, image_id: ImageId, binfile: Image):
     """For each float entity without any data,
     read the value from the binary and set the entity name."""
     assert image_id in (ImageId.ORIG, ImageId.RECOMP), "Invalid image id"
@@ -222,7 +236,7 @@ def complete_partial_floats(db: EntityDb, image_id: ImageId, binfile: PEImage):
                 )
 
 
-def complete_partial_strings(db: EntityDb, image_id: ImageId, binfile: PEImage):
+def complete_partial_strings(db: EntityDb, image_id: ImageId, binfile: Image):
     """For each string/widechar entity without any data,
     read the value from the binary and set the entity name.
     If the entity has no size, read until we hit a null-terminator."""

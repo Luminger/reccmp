@@ -1,7 +1,7 @@
 import re
 import struct
 from typing import Iterator, NamedTuple
-from reccmp.formats import PEImage
+from reccmp.formats import Image
 
 # Match 6 byte absolute jump instructions.
 ABS_JUMP_RE = re.compile(rb"(?<=\xff\x25).{4}", flags=re.S)
@@ -27,7 +27,7 @@ def find_absolute_jumps_in_bytes(
         yield (base_addr + match.start() - 2, jmp_dest)
 
 
-def find_import_thunks(image: PEImage) -> Iterator[ImportThunk]:
+def find_import_thunks(image: Image) -> Iterator[ImportThunk]:
     """Imported functions may generate a thunk function somewhere in the code section.
     These are 6-byte JMP instructions with absolute offset.
     The functions given may or may not be thunks. For example: MSVC  _getSystemCP function
