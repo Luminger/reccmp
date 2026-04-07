@@ -1,6 +1,7 @@
 import logging
 import difflib
 import struct
+from pathlib import Path
 from typing import Iterable, Iterator
 from typing_extensions import Self
 from reccmp.project.detect import RecCmpTarget
@@ -9,9 +10,16 @@ from reccmp.dir import source_code_search
 from reccmp.compare.functions import FunctionComparator
 from reccmp.formats import (
     Image,
+    LXImage,
     PEImage,
     TextFile,
     detect_image,
+)
+from reccmp.formats.mz import ImageDosHeader
+from reccmp.formats.watcom_debug import (
+    WatcomDebugInfo,
+    WatcomDebugNotFoundError,
+    parse_watcom_debug,
 )
 from reccmp.cvdump import Cvdump, CvdumpTypesParser, CvdumpAnalysis
 from reccmp.types import EntityType, ImageId
@@ -52,6 +60,9 @@ from .ingest import (
     load_cvdump_lines,
     load_markers,
     load_data_sources,
+    load_watcom_debug,
+    load_watcom_lines,
+    match_watcom_symbols,
 )
 from .mutate import (
     match_array_elements,
@@ -70,8 +81,10 @@ class Compare:
     _db: EntityDb
     _debug: bool
     _lines_db: LinesDb
+    _watcom_orig: WatcomDebugInfo | None
+    _watcom_recomp: WatcomDebugInfo | None
     code_files: list[TextFile]
-    cvdump_analysis: CvdumpAnalysis
+    cvdump_analysis: CvdumpAnalysis | None
     orig_bin: Image
     recomp_bin: Image
     report: ReccmpReportProtocol
@@ -86,8 +99,8 @@ class Compare:
         self,
         orig_bin: Image,
         recomp_bin: Image,
-        pdb_file: CvdumpAnalysis,
-        target_id: str,
+        pdb_file: CvdumpAnalysis | None = None,
+        target_id: str = "",
         code_files: list[TextFile] | None = None,
         data_sources: list[TextFile] | None = None,
     ):
@@ -111,6 +124,8 @@ class Compare:
 
         self._lines_db = LinesDb()
         self._db = EntityDb()
+        self._watcom_orig = None
+        self._watcom_recomp = None
 
         # For now, just redirect match alerts to the logger.
         self.report = create_logging_wrapper(logger)
@@ -122,10 +137,25 @@ class Compare:
         )
 
     def run(self):
-        if not isinstance(self.orig_bin, PEImage) or not isinstance(
-            self.recomp_bin, PEImage
+        """Analyse both binaries and populate the entity database.
+
+        Dispatches to the appropriate pipeline based on image type:
+        - Both PE  → :meth:`_run_pe`  (MSVC/PDB)
+        - Both LX  → :meth:`_run_watcom`  (Open Watcom / DOS4GW)
+        - Anything else → no-op (e.g. RawImage in tests)
+        """
+        if isinstance(self.orig_bin, PEImage) and isinstance(self.recomp_bin, PEImage):
+            self._run_pe()
+        elif isinstance(self.orig_bin, LXImage) and isinstance(
+            self.recomp_bin, LXImage
         ):
-            return
+            self._run_watcom()
+
+    def _run_pe(self):
+        """Analysis pipeline for MSVC PE binaries (PDB-based)."""
+        assert self.cvdump_analysis is not None, (
+            "_run_pe() requires a CvdumpAnalysis; construct via from_target()"
+        )
 
         load_cvdump_types(self.cvdump_analysis, self.types)
         load_cvdump(self.cvdump_analysis, self._db, self.recomp_bin)
@@ -176,6 +206,123 @@ class Compare:
         name_thunks(self._db)
 
         match_strings(self._db, self.report)
+
+    def _run_watcom(self):
+        """Analysis pipeline for Open Watcom LE binaries.
+
+        Loads symbols and line numbers from embedded Watcom Debug Info 3.0
+        (if present in each binary), then matches by raw mangled symbol name.
+        Source-code annotations are applied last so they can supplement or
+        override the debug-info matches.
+
+        MSVC-specific passes (vtables, SEH, thunks, exports, vtordisps) are
+        skipped — they are either individually guarded in analyze.py or simply
+        not applicable to Watcom-compiled binaries.
+        """
+        assert isinstance(self.orig_bin, LXImage)
+        assert isinstance(self.recomp_bin, LXImage)
+
+        if self._watcom_orig is not None:
+            load_watcom_debug(self._watcom_orig, self._db, self.orig_bin, ImageId.ORIG)
+            load_watcom_lines(self._watcom_orig, self._lines_db, self.orig_bin)
+
+        if self._watcom_recomp is not None:
+            load_watcom_debug(
+                self._watcom_recomp, self._db, self.recomp_bin, ImageId.RECOMP
+            )
+            load_watcom_lines(self._watcom_recomp, self._lines_db, self.recomp_bin)
+
+        match_watcom_symbols(self._db)
+
+        load_markers(
+            self.code_files,
+            self._lines_db,
+            self.orig_bin,
+            self.target_id,
+            self._db,
+            self.report,
+        )
+
+        load_data_sources(self._db, self.data_sources)
+
+        for img_id, binfile in (
+            (ImageId.ORIG, self.orig_bin),
+            (ImageId.RECOMP, self.recomp_bin),
+        ):
+            create_imports(self._db, img_id, binfile)
+            create_analysis_floats(self._db, img_id, binfile)
+            complete_partial_floats(self._db, img_id, binfile)
+            complete_partial_strings(self._db, img_id, binfile)
+
+    @classmethod
+    def from_watcom_target(
+        cls,
+        original_path: Path,
+        recompiled_path: Path,
+        source_paths: Iterable[Path] = (),
+        target_id: str = "",
+        original_mz_offset: int = 0,
+    ) -> Self:
+        """Construct and run a Compare for Open Watcom / DOS4GW LE binaries.
+
+        Parameters
+        ----------
+        original_path:
+            Path to the original binary.  For plain DOS/4GW the outer MZ
+            e_lfanew points directly at LE and *original_mz_offset* should be
+            left at 0.  For DOS/4GW Professional the caller must walk the BW
+            chain first and pass the resulting inner MZ file offset here.
+        recompiled_path:
+            Path to the recompiled binary (wlink output).  Always plain MZ→LE.
+        source_paths:
+            Optional source-code directories to scan for ``// FUNCTION:``
+            annotations.
+        target_id:
+            The target identifier used in source annotations (e.g. ``"C2"``).  If
+            omitted, annotation matching is skipped.
+        original_mz_offset:
+            File offset of the inner MZ stub in a DOS/4GW Pro executable.
+            Pass 0 (default) for plain DOS/4GW.
+        """
+        # Load original binary
+        orig_data = original_path.read_bytes()
+        if original_mz_offset == 0:
+            orig_bin = detect_image(original_path)
+        else:
+            inner_mz, _ = ImageDosHeader.from_memory(orig_data, original_mz_offset)
+            orig_bin = LXImage.from_memory(
+                orig_data, inner_mz, original_path, mz_offset=original_mz_offset
+            )
+
+        # Load recompiled binary (always plain MZ→LE from wlink)
+        recomp_bin = detect_image(recompiled_path)
+
+        # Attempt to parse Watcom debug info from both binaries
+        def _try_parse(data: bytes) -> WatcomDebugInfo | None:
+            try:
+                return parse_watcom_debug(data)
+            except WatcomDebugNotFoundError:
+                return None
+
+        watcom_orig   = _try_parse(orig_data)
+        watcom_recomp = _try_parse(recompiled_path.read_bytes())
+
+        code_files: list[TextFile] = []
+        if target_id:
+            code_paths = source_code_search(source_paths)
+            code_files = list(TextFile.from_files(code_paths, allow_error=True))
+
+        compare = cls(
+            orig_bin,
+            recomp_bin,
+            pdb_file=None,
+            target_id=target_id,
+            code_files=code_files,
+        )
+        compare._watcom_orig   = watcom_orig
+        compare._watcom_recomp = watcom_recomp
+        compare.run()
+        return compare
 
     @classmethod
     def from_target(cls, target: RecCmpTarget) -> Self:
